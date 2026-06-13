@@ -25,6 +25,7 @@ DEF TILE_PLAYER     EQU $07
 DEF MAP_COLS        EQU 12
 DEF MAP_ROWS        EQU 12
 DEF MAP_SIZE        EQU 144
+DEF ROWS_PER_FRAME  EQU 1    ; rows copied per VBlank: MAP_ROWS/ROWS_PER_FRAME = 12 frames per full redraw
 
 ; Top-left corner of the 12x12 play area on the 32x32 background tilemap
 DEF MAP_DISPLAY_COL EQU 4
@@ -40,7 +41,7 @@ DEF ENDING_STR_COL  EQU 3
 DEF ENDING_KEY_ROW  EQU 7
 DEF ENDING_KEY_COL  EQU 3
 
-DEF LEVEL_COUNT     EQU 3
+DEF LEVEL_COUNT     EQU 10
 
 ; Button bitmasks (active-high, as returned by readKeys)
 DEF PADB_A      EQU %00000001
@@ -99,9 +100,13 @@ ShadowOAM:      ds 40 * 4
 wKeyHeld:       db
 wKeyPressed:    db
 ; wMapDirty: set to 1 by UpdateOneTile whenever wMapBuffer changes.
-; DrawMapToBackground is only called during VBlank when this flag is set,
-; keeping VRAM writes strictly inside VBlank.
 wMapDirty:      db
+; wRedrawRow: row at which the next partial redraw should continue.
+; A value >= MAP_ROWS means "no redraw pending" (idle).
+wRedrawRow:     db
+wFallingTile:   db
+
+
 
 ; ====================================================================
 ; ROM HEADER
@@ -135,6 +140,7 @@ TitleScreen:
   call SafeTurnOffLCD
   call ResetBG
   call ClearShadowOAM
+
   call CopyShadowOAMtoOAM
 
   ld hl, TILEMAP0 + TITLE_STR_COL + (TITLE_STR_ROW * 32)
@@ -169,12 +175,15 @@ StartLevel:
   call ClearShadowOAM
 
   call LoadLevel
-  call DrawMapToBackground    ; initial draw while PPU is off, always safe
+  call DrawMapToBackground    ; initial full draw while PPU is off, always safe
 
   xor a
   ld [wKeyPressed], a
   ld [wKeyHeld], a
   ld [wMapDirty], a           ; map was just drawn; nothing pending
+
+  ld a, MAP_ROWS
+  ld [wRedrawRow], a          ; >= MAP_ROWS means idle, no redraw pending
 
   ld a, LCDC_ON | LCDC_OBJ_ON | LCDC_BG_ON | LCDC_BLOCK01
   ld [rLCDC], a
@@ -183,8 +192,9 @@ StartLevel:
 ; MainLoop: input -> logic -> sprites -> VBlank -> VRAM/OAM -> repeat.
 ;
 ; VRAM and OAM are only written inside VBlank (after WaitVBlank):
-;   - DrawMapToBackground: redraws map tiles, only when wMapDirty is set.
-;   - CopyShadowOAMtoOAM:  copies player sprite to hardware OAM.
+;   - DrawMapRows: copies ROWS_PER_FRAME rows of the map per VBlank,
+;     triggered by wMapDirty; the full redraw takes MAP_ROWS frames.
+;   - CopyShadowOAMtoOAM: copies player sprite to hardware OAM.
 ; ---------------------------------------------------------------------------
 MainLoop:
   call readKeys
@@ -193,13 +203,27 @@ MainLoop:
 
   call WaitVBlank
 
-  ; Redraw background tilemap only when the map actually changed
+  ; A map change schedules a fresh redraw starting from the top row.
+  ; DrawMapRows copies ROWS_PER_FRAME rows per VBlank, so the full
+  ; MAP_ROWS-row map takes MAP_ROWS / ROWS_PER_FRAME = 12 frames to complete.
   ld a, [wMapDirty]
   and a
-  jr z, .skipDraw
-  call DrawMapToBackground    ; inside VBlank: safe VRAM write
+  jr z, .checkRedraw
   xor a
   ld [wMapDirty], a
+  ld [wRedrawRow], a          ; (re)start redraw at row 0
+
+.checkRedraw:
+  ld a, [wRedrawRow]
+  cp MAP_ROWS
+  jr nc, .skipDraw            ; >= MAP_ROWS: nothing pending
+  ld b, a                     ; B = start row for this frame
+  ld c, ROWS_PER_FRAME        ; C = rows to copy this frame
+  call DrawMapRows            ; inside VBlank: safe VRAM write
+  ld a, [wRedrawRow]
+  add ROWS_PER_FRAME
+  ld [wRedrawRow], a          ; advance; once >= MAP_ROWS the task is done
+
 .skipDraw:
   call CopyShadowOAMtoOAM     ; inside VBlank: safe OAM write
   jp MainLoop
@@ -412,7 +436,7 @@ UpdateGameState:
   pop de
   cp TILE_STAIRS
   jr z, .doUpMove         ; target is a ladder -> always allow
- 
+
   ; target is not a ladder; only allow if the player stands on one
   push de
   ld a, [wPlayerX]
@@ -423,10 +447,10 @@ UpdateGameState:
   pop de
   cp TILE_STAIRS
   jr nz, .checkDown       ; not on a ladder -> block upward move
-  
+
 .doUpMove:
   call TryMove
-  jr .checkWin  
+  jr .checkWin
 
 .checkDown:
   ld a, [wKeyPressed]
@@ -515,8 +539,16 @@ DrawString:
 ; readKeys: reads all 8 buttons and stores results in WRAM.
 ;
 ; Output:
-;   wKeyHeld    = raw state (all currently held buttons)
-;   wKeyPressed = rising edge (buttons newly pressed this frame)
+;   b        = raw state (all currently held buttons)
+;   c        = rising edge (buttons newly pressed this frame)
+;   wKeyHeld    = same as b, stored in WRAM
+;   wKeyPressed = same as c, stored in WRAM
+;   [current]   = same as c (internal use by readKeys)
+;   [previous]  = updated to current raw state (do not touch externally)
+;
+; Bit layout of wKeyHeld / wKeyPressed:
+;   down up left right start select B A
+;   7    6   5    4     3     2      1 0
 ;---------------------------------------------------------------------
 readKeys:
   ld    a, $20
@@ -583,8 +615,8 @@ GetTileAtXY:
 
 ; ---------------------------------------------------------------------------
 ; UpdateOneTile: writes tile A at logical position (D, E) into wMapBuffer,
-; and sets wMapDirty so the next VBlank redraws the full tilemap.
-; VRAM is NOT touched here.
+; and sets wMapDirty to trigger a full redraw over the following VBlanks.
+; VRAM is NOT touched here; DrawMapRows handles the actual VRAM write.
 ;
 ; Input:  A = new tile ID, D = X, E = Y
 ; Preserves: BC, DE
@@ -600,17 +632,61 @@ UpdateOneTile:
   ret
 
 ; ---------------------------------------------------------------------------
-; DrawMapToBackground: copies the full wMapBuffer into the background tilemap.
-; Must be called during VBlank (or while PPU is off) to safely write VRAM.
+; DrawMapToBackground: copies the full wMapBuffer into the background tilemap
+; by calling DrawMapRows for all MAP_ROWS rows at once.
+; Must be called while the PPU is off (e.g. from StartLevel), since copying
+; all 12 rows at once exceeds the VBlank cycle budget.
+; For in-game per-frame updates use DrawMapRows directly (via MainLoop).
+; ---------------------------------------------------------------------------
+DrawMapToBackground:
+  ld b, 0                 ; start at row 0
+  ld c, MAP_ROWS          ; copy every row
+  ; fall through into DrawMapRows
+
+; ---------------------------------------------------------------------------
+; DrawMapRows: copies a horizontal band of the map into the background tilemap.
+; (Also the fall-through target of DrawMapToBackground.)
+;
+; Copying only ROWS_PER_FRAME rows per VBlank keeps each call inside the
+; VBlank budget. The full redraw takes MAP_ROWS / ROWS_PER_FRAME = 12 frames.
 ;
 ; The play area starts at (MAP_DISPLAY_COL, MAP_DISPLAY_ROW) in the 32-wide
 ; tilemap. After each 12-column row, HL is advanced by 20 to skip the
-; remaining columns (32 - 12 = 20).
+; remaining columns (32 - 12 = 20). The source in wMapBuffer is contiguous,
+; so DE needs no per-row adjustment.
+;
+; Input:  B = start row (0..MAP_ROWS-1), C = number of rows to copy
 ; ---------------------------------------------------------------------------
-DrawMapToBackground:
-  ld de, wMapBuffer
-  ld hl, TILEMAP0 + MAP_DISPLAY_ROW * 32 + MAP_DISPLAY_COL
-  ld b, MAP_ROWS
+DrawMapRows:
+  push bc                 ; keep start row + row count
+
+  ; DE = wMapBuffer + startRow * MAP_COLS   (MAP_COLS = 12)
+  ld a, b
+  add a                   ; *2
+  add a                   ; *4
+  ld e, a                 ; e = startRow * 4
+  add a                   ; *8
+  add e                   ; *12
+  add LOW(wMapBuffer)
+  ld e, a
+  ld a, 0
+  adc HIGH(wMapBuffer)
+  ld d, a
+
+  ; HL = TILEMAP0 + (MAP_DISPLAY_ROW + startRow) * 32 + MAP_DISPLAY_COL
+  ld h, 0
+  ld l, b                 ; HL = startRow
+  add hl, hl              ; *2
+  add hl, hl              ; *4
+  add hl, hl              ; *8
+  add hl, hl              ; *16
+  add hl, hl              ; *32  -> HL = startRow * 32
+  ld bc, TILEMAP0 + MAP_DISPLAY_ROW * 32 + MAP_DISPLAY_COL
+  add hl, bc
+
+  pop bc                  ; recover row count into C
+  ld b, c                 ; B = number of rows still to copy
+
 .rowLoop:
   ld c, MAP_COLS
 .colLoop:
@@ -654,6 +730,12 @@ TryMove:
 
   cp TILE_SAND
   jr nz, .checkMonster
+  ; Only horizontal movement can dig sand
+  ld a, [wTargetY]
+  ld b, a
+  ld a, [wPlayerY]
+  cp b
+  jp nz, .blocked
   ld a, TILE_NOTHING
   call UpdateOneTile
   jr .doMove
@@ -724,6 +806,7 @@ TryMove:
   ; run gravity so displaced rocks above can fall.
   call ApplyGravityToAll
   call ApplyGravityToPlayer
+  call ApplyGravityToAll
   ret
 
 .doMove:
@@ -734,6 +817,7 @@ TryMove:
 
   call ApplyGravityToAll
   call ApplyGravityToPlayer
+  call ApplyGravityToAll
   ret
 
 .blocked:
@@ -754,7 +838,7 @@ ApplyGravityToPlayer:
   pop de
   cp TILE_STAIRS
   ret z                   ; standing on a ladder -> no falling
- 
+
   ; Check the tile directly below the player
   ld a, [wPlayerX]
   ld d, a
@@ -771,9 +855,9 @@ ApplyGravityToPlayer:
   jr .loop
 
 ; ---------------------------------------------------------------------------
-; ApplyGravityToAll: repeatedly scans the map bottom-to-top, dropping ROCK,
-; MONSTER, and SAND tiles one row per pass. Repeats until no tile moves.
-; GHOST tiles are not affected by gravity.
+; ApplyGravityToAll: repeatedly scans the map bottom-to-top, dropping ROCK
+; and MONSTER tiles one row per pass. Repeats until no tile moves.
+; GHOST tiles and SAND are not affected by gravity.
 ;
 ; Registers: B = movement flag, C = current row, D = current column
 ; ---------------------------------------------------------------------------
@@ -795,12 +879,10 @@ ApplyGravityToAll:
   jr z, .isFalling
   cp TILE_MONSTER
   jr z, .isFalling
-  cp TILE_SAND
-  jr z, .isFalling
-  jr .nextCol             ; GHOST and others are not affected by gravity
+  jr .nextCol             ; GHOST, SAND, and others are not affected by gravity
 
 .isFalling:
-  ld [wTargetX], a        ; temporarily save the tile type
+  ld [wFallingTile], a
 
   ; Check the tile directly below
   push bc
@@ -833,7 +915,7 @@ ApplyGravityToAll:
   ld a, e
   inc a
   ld e, a
-  ld a, [wTargetX]
+  ld a, [wFallingTile]
   call UpdateOneTile      ; place tile at (D, E+1)
   pop de
   pop bc
@@ -1017,7 +1099,13 @@ LevelTable:
   dw Level0Data
   dw Level1Data
   dw Level2Data
-
+  dw Level3Data
+  dw Level4Data
+  dw Level5Data
+  dw Level6Data
+  dw Level7Data
+  dw Level8Data
+  dw Level9Data
 
 ; Level data: 12x12 tile IDs, row-major.
 ; Encoding: 0=Nothing 1=Stairs 2=Monster 3=Rock 4=Sand 5=Wall 6=Ghost 7=Player
@@ -1026,7 +1114,7 @@ Level0Data:
   db 5,5,5,5,5,5,5,5,5,5,5,5
   db 5,0,0,0,0,0,0,0,0,0,0,5
   db 5,0,0,0,0,0,0,0,0,0,0,5
-  db 5,0,4,0,0,0,0,0,0,0,0,5
+  db 5,0,0,0,0,0,0,0,0,0,0,5
   db 5,7,4,0,3,0,0,2,0,0,0,5
   db 5,5,5,5,5,0,5,5,5,5,5,5
   db 5,5,5,5,5,5,5,5,5,5,5,5
@@ -1049,18 +1137,115 @@ Level1Data:
   db 5,5,5,5,5,5,5,5,5,5,5,5
   db 5,5,5,5,5,5,5,5,5,5,5,5
   db 5,5,5,5,5,5,5,5,5,5,5,5
-  
+
 Level2Data:
-  db 5,5,5,5,5,5,5,5,5,5,5,5 
-  db 5,5,5,5,5,5,5,5,5,5,5,5 
-  db 5,5,5,5,5,5,5,3,1,5,5,5 
-  db 5,5,5,5,5,5,5,2,1,5,5,5 
-  db 5,5,5,5,5,5,5,3,1,5,5,5 
-  db 5,5,0,0,0,0,0,2,1,5,5,5 
-  db 5,5,0,6,6,6,6,2,1,5,5,5 
-  db 5,5,0,0,0,0,0,3,1,5,5,5 
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,3,1,5,5,5
+  db 5,5,5,5,5,5,5,2,1,5,5,5
+  db 5,5,5,5,5,5,5,3,1,5,5,5
+  db 5,5,0,0,0,0,0,2,1,5,5,5
+  db 5,5,0,6,6,6,6,2,1,5,5,5
+  db 5,5,0,0,0,0,0,3,1,5,5,5
   db 5,5,0,5,5,5,5,5,1,5,5,5
   db 5,5,0,0,0,7,0,0,1,5,5,5
   db 5,5,5,5,5,5,5,5,5,5,5,5
   db 5,5,5,5,5,5,5,5,5,5,5,5
-  
+
+Level3Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,0,0,0,0,0,0,5,0,0,0,5
+  db 5,6,4,1,0,0,0,5,1,2,0,5
+  db 5,4,4,1,5,0,0,5,1,5,5,5
+  db 5,0,0,1,0,5,0,0,1,0,0,5
+  db 5,0,0,1,0,0,5,0,1,0,0,5
+  db 5,0,0,1,0,0,0,5,0,0,0,5
+  db 5,0,5,1,0,0,0,0,5,5,5,5
+  db 5,0,0,1,3,0,0,0,0,0,0,5
+  db 5,0,0,1,4,3,0,0,2,0,3,5
+  db 5,7,0,1,5,5,0,0,1,0,2,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level4Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,0,0,0,0,0,0,6,0,3,0,5
+  db 5,0,0,0,0,3,2,0,4,4,1,5
+  db 5,0,0,0,0,5,5,5,5,5,1,5
+  db 5,0,0,0,0,0,3,0,0,0,1,5
+  db 5,0,0,0,0,2,4,0,0,0,1,5
+  db 5,0,0,0,0,5,5,5,1,0,1,5
+  db 5,0,0,0,0,0,0,0,1,0,1,5
+  db 5,0,0,6,0,0,0,0,1,0,1,5
+  db 5,0,0,0,0,0,0,0,1,0,1,5
+  db 5,7,0,0,0,0,2,0,1,0,1,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level5Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,0,0,0,0,0,3,0,0,0,5
+  db 5,5,0,5,5,5,1,1,1,1,1,5
+  db 5,5,0,0,0,0,0,0,0,0,1,5
+  db 5,5,0,0,0,0,0,0,0,0,1,5
+  db 5,4,0,0,0,0,0,0,0,0,1,5
+  db 5,4,0,0,0,0,0,0,0,0,1,5
+  db 5,4,0,0,0,0,0,0,0,0,1,5
+  db 5,4,0,0,0,6,0,0,0,0,1,5
+  db 5,5,5,5,0,0,0,0,0,0,1,5
+  db 5,5,5,5,3,7,0,0,0,0,1,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level6Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,0,0,0,0,0,0,0,0,0,0,5
+  db 5,0,0,0,0,0,0,0,0,0,0,5
+  db 5,0,3,0,0,0,5,0,0,0,0,5
+  db 5,0,3,6,0,0,5,0,0,0,2,5
+  db 5,1,4,0,0,3,5,5,1,5,5,5
+  db 5,1,3,0,0,3,0,0,1,5,5,5
+  db 5,1,3,0,0,3,0,0,1,5,5,5
+  db 5,1,4,0,0,4,0,0,1,5,5,5
+  db 5,1,0,0,5,5,0,0,1,5,5,5
+  db 5,1,0,7,5,5,0,0,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level7Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,0,0,3,0,5,0,0,0,0,0,5
+  db 5,0,0,3,0,5,0,0,0,0,2,5
+  db 5,1,4,3,0,5,5,1,5,5,5,5
+  db 5,1,3,4,3,0,0,1,0,0,0,5
+  db 5,1,3,0,3,0,0,1,0,0,0,5
+  db 5,1,4,0,4,0,0,1,0,0,0,5
+  db 5,1,0,0,5,0,0,0,0,0,0,5
+  db 5,1,7,0,5,0,0,0,0,0,0,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level8Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,0,0,0,0,0,0,0,0,0,5,5
+  db 5,0,0,0,0,0,0,0,3,0,5,5
+  db 5,1,5,2,2,2,2,2,3,2,5,5
+  db 5,1,7,4,4,4,4,4,4,4,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+
+Level9Data:
+  db 5,5,5,5,5,5,5,5,5,5,5,5
+  db 5,5,5,5,0,0,0,0,0,0,0,5
+  db 5,5,5,5,0,0,0,3,0,0,0,5
+  db 5,5,5,5,0,0,0,3,0,0,0,5
+  db 5,5,5,5,0,0,1,2,0,0,0,5
+  db 5,5,5,5,0,0,1,2,0,0,6,5
+  db 5,5,5,5,0,0,1,6,0,0,6,5
+  db 5,0,0,0,0,0,1,0,6,2,0,5
+  db 5,0,0,0,0,0,1,2,0,2,0,5
+  db 5,0,0,0,0,0,1,5,6,6,0,5
+  db 5,0,0,7,0,0,1,0,2,0,0,5
+  db 5,5,5,5,5,5,5,5,5,5,5,5
